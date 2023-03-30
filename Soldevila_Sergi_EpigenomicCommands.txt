@@ -1,0 +1,337 @@
+######## Sergi Soldevila Gálvez
+######## 30-03-23
+######## Msc in Omics Data Analysis
+######## Epigenomics
+######## Practical exam
+
+#_________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________#
+
+# Run a Docker container with the dgarrimar/epigenomics_course imag
+sudo docker run -v $PWD:$PWD -w $PWD --rm -it dgarrimar/epigenomics_course
+
+
+##############################################################
+####### 4. EN‐TEx ATAC‐seq data: downstream analyses #########
+##############################################################
+
+### Q1 ###
+# Change the current directory to "epigenomics_uvic/ATAC-seq/"
+cd epigenomics_uvic/ATAC-seq/
+
+# Create several directories for organizing data.
+mkdir data analyses annotation data/bigBed.files analyses/peaks.analysis data/bed.files
+
+
+
+
+### Q2 ###
+# Retrieve metadata from ENCODE using download.metadata.sh script
+../bin/download.metadata.sh "https://www.encodeproject.org/metadata/?replicates.library.biosample.donor.uuid=d370683e-81e7-473f-8475-7716d027849b&status=released&status=submitted&status=in+progress&assay_title=ATAC-seq&biosample_ontology.term_name=stomach&biosample_ontology.term_name=sigmoid+colon&type=Experiment"
+
+# Select bigBed narrow, pseudoreplicated peaks and assembly GRCH38
+grep -F "bigBed_narrowPeak" metadata.tsv |\
+grep -F "pseudoreplicated_peaks" |\
+grep -F "GRCh38" |\
+awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+sort -k2,2 -k1,1r |\
+sort -k2,2 -u > analyses/bigBed.peaks.ids.txt
+
+# Extract the first column from "analyses/bigBed.peaks.ids.txt" and download the corresponding ".bigBed" file from the ENCODE website
+cut -f1 analyses/bigBed.peaks.ids.txt |\
+while read filename; do
+  wget -P data/bigBed.files "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+done
+
+# Make sure md5sum values coincide with ENCODE:
+## Retrieve original MD5 hash from the metadata using selectRows.sh script
+  ../bin/selectRows.sh <(cut -f1 analyses/bigBed.*.ids.txt) metadata.tsv | cut -f1,46 > data/bigBed.files/md5sum.txt
+
+## Compute MD5 hash on the downloaded files 
+cat data/bigBed.files/md5sum.txt |\
+while read filename original_md5sum; do 
+  md5sum data/bigBed.files/"$filename".bigBed |\
+  awk -v filename="$filename" -v original_md5sum="$original_md5sum" 'BEGIN{FS=" "; OFS="\t"}{print filename, original_md5sum, $1}' 
+done > tmp 
+mv tmp data/bigBed.files/md5sum.txt
+
+# Make sure there are no files for which original and computed MD5 hashes differ
+awk '$2!=$3' data/bigBed.files/md5sum.txt # md5sum values coincide with the ones provided by ENCODE
+
+
+
+
+### Q3 ###
+# Download a GTF file for the GENCODE version 24 annotation from the ENCODE website
+wget -P annotation "https://www.encodeproject.org/files/gencode.v24.primary_assembly.annotation/@@download/gencode.v24.primary_assembly.annotation.gtf.gz"
+
+# Uncompresses the downloaded GTF file using "gunzip"
+gunzip annotation/gencode.v24.primary_assembly.annotation.gtf.gz
+
+
+#### Q3.1 ####
+# Extract the first column from "analyses/bigBed.peaks.ids.txt" and converts each corresponding ".bigBed" file to a ".bed" file using "bigBedToBed"
+cut -f1 analyses/bigBed.peaks.ids.txt |\
+while read filename; do
+  bigBedToBed data/bigBed.files/"$filename".bigBed data/bed.files/"$filename".bed
+done
+
+# Download a BED file containing transcription start site (TSS) annotations for protein-coding genes
+wget -P annotation "https://public-docs.crg.es/rguigo/Data/bborsari/UVIC/epigenomics_course/gencode.v24.protein.coding.non.redundant.TSS.bed"
+
+# Extract the first two columns from "analyses/bigBed.peaks.ids.txt" and for each corresponding ".bed" file, it finds overlapping genes with the TSS annotations using "bedtools intersect"
+# Saves the results to a file with a name that includes the tissue type
+cut -f-2 analyses/bigBed.peaks.ids.txt |\
+while read filename tissue; do 
+  bedtools intersect -b annotation/gencode.v24.protein.coding.non.redundant.TSS.bed -a data/bed.files/"$filename".bed -u > analyses/peaks.analysis/genes.with.peaks."$tissue".txt
+done
+
+# Counts the number of lines = peaks that interesect promoter regions (results are shown below the command)
+wc -l analyses/peaks.analysis/genes.with.peaks.s*
+ ## 47871 analyses/peaks.analysis/genes.with.peaks.sigmoid_colon.txt
+ ## 44749 analyses/peaks.analysis/genes.with.peaks.stomach.txt
+ ## 92620 total
+
+
+#### Q3.2 ####
+# Extract protein-coding genes from the annotation file "gencode.v24.primary_assembly.annotation.gtf".
+awk '$3=="gene"' annotation/gencode.v24.primary_assembly.annotation.gtf |\
+grep -F "protein_coding" |\
+cut -d ";" -f1 |\
+awk 'BEGIN{OFS="\t"}{print $1, $4, $5, $10, 0, $7, $10}' |\
+sed 's/\"//g' |\
+awk 'BEGIN{FS=OFS="\t"}$1!="chrM"{$2=($2-1); print $0}' > annotation/gencode.v24.protein.coding.gene.body.bed
+
+# Find genes that do not intersect with the peaks identified in the bigBed files
+cut -f-2 analyses/bigBed.peaks.ids.txt |\
+while read filename tissue; do 
+  bedtools intersect -b annotation/gencode.v24.protein.coding.gene.body.bed -a data/bed.files/"$filename".bed -v > analyses/peaks.analysis/genes.with.offregion.peaks."$tissue".txt
+done
+
+# Counting the number of lines = number of peaks that do not intersect in the gene coordinates (results are shown below the command)
+wc -l analyses/peaks.analysis/genes.with.offregion.peaks.s*
+  ## 37035 analyses/peaks.analysis/genes.with.offregion.peaks.sigmoid_colon.txt
+  ## 34537 analyses/peaks.analysis/genes.with.offregion.peaks.stomach.txt
+  ## 71572 total
+
+
+
+
+
+
+
+
+#############################################
+####### 5. Distal regulatory activity #######
+#############################################
+
+### Q1 ###
+# Go to the parent directory
+cd ..
+
+# Create a new directory named regulatory_elements
+mkdir regulatory_elements
+
+
+
+
+### Q2 ###
+# Create several directories for organizing data.
+mkdir regulatory_elements/data regulatory_elements/data/bigBed.files regulatory_elements/data/bed.files regulatory_elements/analyses regulatory_elements/analyses/peaks.analysis
+
+# For each of the modifications "H3K4me1" and "H3K27ac":
+## Retreive the experiment names and the correspoding bigBed files from ENCODE.
+for modification in H3K4me1 H3K27ac; do
+    grep -F "$modification" ChIP-seq/metadata.tsv |\
+    grep -F "bigBed_narrowPeak" |\
+    grep -F "pseudoreplicated_peaks" |\
+    grep -F "GRCh38" |\
+    awk 'BEGIN{FS=OFS="\t"}{print $1, $11, $23}' |\
+    sort -k2,2 -k1,1r |\
+    sort -k2,2 -u > regulatory_elements/analyses/bigBed.peaks.ids."$modification".txt
+
+    cut -f1 regulatory_elements/analyses/bigBed.peaks.ids."$modification".txt |\
+    while read filename; do
+      wget -P regulatory_elements/data/bigBed.files "https://www.encodeproject.org/files/$filename/@@download/$filename.bigBed"
+    done
+done
+
+# Convert bigBed files to bed files
+cut -f1 regulatory_elements/analyses/bigBed.peaks.ids.H3K*|\
+while read filename; do
+  bigBedToBed regulatory_elements/data/bigBed.files/"$filename".bigBed regulatory_elements/data/bed.files/"$filename".bed
+done
+
+# Check the experiment names and the correspoding tissue and histone medification (results are shown below the command)
+head regulatory_elements/analyses/bigBed.peaks.ids.H3K*
+   ## ENCFF872UHN	sigmoid_colon	H3K27ac-human
+   ## ENCFF977LBD	stomach	H3K27ac-human
+   ## ENCFF724ZOF	sigmoid_colon	H3K4me1-human
+   ## ENCFF844XRN	stomach	H3K4me1-human
+
+## Intersect sigmoid_colon
+bedtools intersect -a regulatory_elements/data/bed.files/ENCFF724ZOF* -b regulatory_elements/data/bed.files/ENCFF872UHN* -u  > regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.sigmoid_colon.txt
+
+## Intersect stomach
+bedtools intersect -a regulatory_elements/data/bed.files/ENCFF844XRN* -b regulatory_elements/data/bed.files/ENCFF977LBD* -u > regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.stomach.txt
+
+# Check the number of peaks that intersect from both histone metilations in both tissues (results are shown below the command)
+wc -l regulatory_elements/analyses/peaks.analysis/*
+  ## 53615 regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.sigmoid_colon.txt
+  ## 40992 regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.stomach.txt
+  ## 94607 total
+
+# Desital regulatory regions sigmoid_colon
+bedtools intersect -a regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.sigmoid_colon.txt -b ATAC-seq/analyses/peaks.analysis/genes.with.offregion.peaks.sigmoid_colon.txt -u > regulatory_elements/analyses/peaks.analysis/Regulatory_regions_sigmoid_colon.txt
+
+# Desital regulatory regions stomach
+bedtools intersect -a regulatory_elements/analyses/peaks.analysis/Overlapped.peaks.stomach.txt -b ATAC-seq/analyses/peaks.analysis/genes.with.offregion.peaks.stomach.txt -u > regulatory_elements/analyses/peaks.analysis/Regulatory_regions_stomach.txt
+
+# Check the number of distal regulatory elements obtained in the analysis for each tissue (results are shown below the command)
+wc -l regulatory_elements/analyses/peaks.analysis/Regulatory_regions_s*
+  ## 8602 regulatory_elements/analyses/peaks.analysis/Regulatory_regions_sigmoid_colon.txt
+  ## 5077 regulatory_elements/analyses/peaks.analysis/Regulatory_regions_stomach.txt
+  ## 13679 total
+
+
+
+
+### Q3 ### 
+# Retrieve columns  5' coordinate and the name of the ATAC-seq peak for Sigmond_colon tissue
+awk 'BEGIN{FS=OFS="\t"}$1=="chr1"{print $4,$2}' regulatory_elements/analyses/peaks.analysis/Regulatory_regions_sigmoid_colon.txt > regulatory_elements/regulatory.elements.starts.sigmond_colon.tsv
+
+# Retrieve columns  5' coordinate and the name of the ATAC-seq peak for Stomach tissue
+awk 'BEGIN{FS=OFS="\t"}$1=="chr1"{print $4,$2}' regulatory_elements/analyses/peaks.analysis/Regulatory_regions_stomach.txt > regulatory_elements/regulatory.elements.starts.stomach.tsv
+
+# Count the number of regulatory elements located in chromosome 1 for both tissues (results are shown below the command)
+wc -l regulatory_elements/regulatory.elements.starts.s*
+  ## 911 regulatory_elements/regulatory.elements.starts.sigmond_colon.tsv
+  ## 627 regulatory_elements/regulatory.elements.starts.stomach.tsv
+  ## 1538 total
+
+
+
+
+### Q4 ### 
+# Store the name of the gene in the first column, and the start coordinate of the gene on the second column
+awk 'BEGIN{FS=OFS="\t"}{if ($6=="+"){start=$2} else {start=$3}; print $4, start}' ATAC-seq/annotation/gencode.v24.protein.coding.gene.body.bed > regulatory_elements/gene.starts.tsv
+
+
+
+
+### Q5 ###
+# Download the python script
+wget -P bin/ https://public-docs.crg.es/rguigo/Data/bborsari/UVIC/epigenomics_course/get.distance.py
+
+# Edit the python script
+nano bin/get.distance.py
+
+#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_# PYTHON SCRIPT #_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#
+
+#************
+# LIBRARIES *
+#************
+
+import sys
+from optparse import OptionParser
+
+
+#*****************
+# OPTION PARSING *
+#*****************
+
+parser = OptionParser()
+parser.add_option("-i", "--input", dest="input")
+parser.add_option("-s", "--start", dest="start")
+options, args = parser.parse_args()
+
+open_input = open(options.input)
+enhancer_start = int(options.start)
+
+
+#********
+# BEGIN *
+#********
+
+x=1000000 # set maximum distance to 1 Mb
+selectedGene="" # initialize the gene as empty
+selectedGeneStart=0 # initialize the start coordinate of the gene as empty
+
+for line in open_input.readlines(): # for each line in the input file
+        gene, y = line.strip().split('\t') # split the line into two columns based on a tab 
+        position = int(y) # define a variable called position that correspond to the integer of the $
+        diff = abs(position - enhancer_start) # compute the absolute value of the difference between$
+
+        if diff < x:# if this absolute value is lower than x
+                x=diff # this value will now be your current x
+                selectedGene = gene# save gene as selectedGene
+                selectedGeneStart=position# save position as selectedGeneStart
+
+print "\t".join([selectedGene, str(selectedGeneStart), str(x)])
+
+#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#_#
+
+# Check the script performance (results are shown below the command)
+python bin/get.distance.py --input regulatory_elements/gene.starts.tsv --start 980000
+   ## ENSG00000167693.16	979770	230
+
+
+
+
+### Q6 ### 
+# Retrieve using the python script the closest gene and the distance to the closest gene from Sigmoid_colon tissue
+cat regulatory_elements/regulatory.elements.starts.sigmond_colon.tsv |\
+while read element start; do     
+  python bin/get.distance.py --input regulatory_elements/gene.starts.tsv --start "$start"; 
+done > regulatory_elements/closest_gene_sigmoid_colon.tsv
+
+# Retrieve using the python script the closest gene and the distance to the closest gene from Stomach tissue
+cat regulatory_elements/regulatory.elements.starts.stomach.tsv |\
+while read element start; do     
+  python bin/get.distance.py --input regulatory_elements/gene.starts.tsv --start "$start"; 
+done > regulatory_elements/closest_gene_stomach.tsv
+
+# Check obtained results
+head regulatory_elements/closest_gene_*
+
+
+
+
+### Q7 ###
+# Open R in regulatory_elements folder
+R regulatory_elements/
+
+# Read a tab-separated file named "closest_gene_sigmoid_colon.tsv" using the read.delim function and stores it in the variable colon.
+colon <- read.delim('./regulatory_elements/closest_gene_sigmoid_colon.tsv', header = F)
+
+# Print the first six rows of the data frame 
+head(colon) # distances are in V3 column
+
+# Print a summary of the values in the third column (distances) of the data frame (results are shown below the command)
+summary(colon$V3)
+   # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   # 20    1873    6343   19968   22062  346619 
+
+# Mean and median are both computed as follows to obtain more accurated results (results are shown below the command)
+mean(colon$V3)
+   # 19968.54
+median(colon$V3)
+   # 6343
+
+
+# # Read a tab-separated file named "closest_gene_stoamch.tsv" using the read.delim function and stores it in the variable stomach.
+stomach <- read.delim('./regulatory_elements/closest_gene_stomach.tsv', header = F)
+
+# Print the first six rows of the data frame
+head(stomach)
+
+# Print a summary of the values in the third column (distances) of the data frame (results are shown below the command)
+summary(stomach$V3)
+   # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   #  3    1778    5579   15602   18248  255471 
+
+# Mean and median are both computed as follows to obtain more accurated results (results are shown below the command)
+mean(stomach$V3)
+   # 15602.34
+ median(stomach$V3)
+   # 5579
+
